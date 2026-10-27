@@ -10,11 +10,15 @@ must NOT delete the session or shut down the kernel. Room GC reclaims memory;
 kernel lifecycle is the user's responsibility.
 """
 import asyncio
+import inspect
+from types import SimpleNamespace
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 from traitlets.config import LoggingConfigurable
 from jupyter_server.services.kernels.kernelmanager import MappingKernelManager
 from jupyter_server_documents.session_manager import YDocSessionManager
+from jupyter_server_documents.websockets.yroom_ws import YRoomWebsocket
+from tornado.web import HTTPError
 
 
 @pytest.fixture
@@ -297,3 +301,138 @@ class TestConsoleSessionHandling:
         session_manager._console_session_ids.add("console-1")
         assert session_manager._is_console_session("console-1")
         assert not session_manager._is_console_session("notebook-1")
+
+
+class TestRoomReconnection:
+    """A returning notebook client must recover its existing kernel binding."""
+
+    async def _linked_session(self, manager):
+        """Create a synthetic notebook session with observable kernel bindings."""
+        model = {
+            "id": "session-123", "type": "notebook", "path": "test.ipynb",
+            "name": "test.ipynb", "kernel": {"id": "kernel-456"},
+        }
+        connected = set()
+        client = Mock()
+
+        async def add(yroom):
+            connected.add(yroom)
+
+        async def remove(yroom):
+            connected.discard(yroom)
+
+        client.add_yroom = AsyncMock(side_effect=add)
+        client.remove_yroom = AsyncMock(side_effect=remove)
+        manager.kernel_manager.get_kernel.return_value = SimpleNamespace(main_client=client)
+        manager.file_id_manager.index.return_value = "file-789"
+        room = self._room()
+        manager.yroom_manager.get_room.return_value = room
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.create_session', AsyncMock(return_value=model)):
+            await manager.create_session(path="test.ipynb", name="test.ipynb", type="notebook")
+        return model, room, client, connected
+
+    def _room(self):
+        """Return a room stub that retains its registered cleanup callbacks."""
+        room = Mock()
+        room.room_id = "json:notebook:file-789"
+        room.callbacks = []
+        room.add_stop_callback.side_effect = room.callbacks.append
+        return room
+
+    async def _open(self, manager, room):
+        """Exercise the actual room WebSocket open path without a network port."""
+        manager.yroom_manager.get_room.return_value = room
+        socket = SimpleNamespace(
+            room_id=room.room_id, yroom_manager=manager.yroom_manager,
+            settings={"session_manager": manager}, close=Mock(), log=Mock(),
+        )
+        result = YRoomWebsocket.open(socket)
+        if inspect.isawaitable(result):
+            await result
+        return socket
+
+    @pytest.mark.asyncio
+    async def test_reopen_after_gc_reattaches_existing_kernel(self, session_manager):
+        """Room GC followed by a new WebSocket must preserve output routing."""
+        model, old, client, connected = await self._linked_session(session_manager)
+        await old.callbacks[0]()
+        assert not connected
+        replacement = self._room()
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(return_value=model)):
+            await self._open(session_manager, replacement)
+        assert connected == {replacement}
+        assert session_manager._room_ids[model["id"]] == replacement.room_id
+        session_manager.kernel_manager.shutdown_kernel.assert_not_called()
+        session_manager.kernel_manager.start_kernel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repeated_reconnects_register_cleanup_once(self, session_manager):
+        """Multiple clients must not accumulate duplicate room-stop callbacks."""
+        model, room, client, connected = await self._linked_session(session_manager)
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(return_value=model)):
+            await asyncio.gather(*(self._open(session_manager, room) for _ in range(5)))
+        assert connected == {room}
+        assert len(room.callbacks) == 1
+        await room.callbacks[0]()
+        assert not connected
+
+    @pytest.mark.asyncio
+    async def test_repeated_gc_cycles_keep_routing_and_cleanup(self, session_manager):
+        """Each replacement room must be attached and later detached exactly once."""
+        model, room, client, connected = await self._linked_session(session_manager)
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(return_value=model)):
+            for _ in range(3):
+                await room.callbacks[0]()
+                assert not connected
+                room = self._room()
+                await self._open(session_manager, room)
+                assert connected == {room}
+                assert len(room.callbacks) == 1
+
+    @pytest.mark.asyncio
+    async def test_reconnect_does_not_attach_another_notebook(self, session_manager):
+        """A room must not be bound to sessions belonging to another document."""
+        model, room, client, connected = await self._linked_session(session_manager)
+        other = self._room()
+        other.room_id = "json:notebook:other-file"
+        lookup = AsyncMock(return_value=model)
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', lookup):
+            await self._open(session_manager, other)
+        lookup.assert_not_awaited()
+        assert connected == {room}
+
+    @pytest.mark.asyncio
+    async def test_expired_session_does_not_start_a_kernel(self, session_manager):
+        """A closed session is skipped instead of recreated during room reconnect."""
+        model, room, client, connected = await self._linked_session(session_manager)
+        await room.callbacks[0]()
+        replacement = self._room()
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(side_effect=HTTPError(404))):
+            await self._open(session_manager, replacement)
+        assert not connected
+        session_manager.kernel_manager.start_kernel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_failure_closes_and_unregisters_client(self, session_manager):
+        """Unexpected binding errors must not leave a falsely connected client."""
+        model, room, client, connected = await self._linked_session(session_manager)
+        room.clients.add.return_value = "new-client"
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(side_effect=HTTPError(500))):
+            with pytest.raises(HTTPError):
+                await self._open(session_manager, room)
+        room.clients.remove.assert_called_once_with("new-client")
+
+    @pytest.mark.asyncio
+    async def test_same_kernel_refresh_registers_replacement_cleanup(self, session_manager):
+        """The manual recovery path must also install cleanup on the new room."""
+        model, old, client, connected = await self._linked_session(session_manager)
+        await old.callbacks[0]()
+        replacement = self._room()
+        session_manager.yroom_manager.get_room.return_value = replacement
+        with patch('jupyter_server.services.sessions.sessionmanager.SessionManager.get_session', AsyncMock(return_value=model)), \
+             patch('jupyter_server.services.sessions.sessionmanager.SessionManager.update_session', AsyncMock()):
+            await session_manager.update_session(model["id"], kernel_id=model["kernel"]["id"])
+        assert connected == {replacement}
+        assert len(replacement.callbacks) == 1
+        await replacement.callbacks[0]()
+        assert not connected

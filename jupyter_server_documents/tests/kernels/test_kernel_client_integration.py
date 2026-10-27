@@ -236,6 +236,123 @@ class TestDocumentAwareKernelClientIntegration:
         # Verify the message was suppressed (returned None)
         assert result is None
 
+    async def _timing_message(self, client, kind, content, timestamp, request_id="timed-request", metadata=None):
+        """Deliver a signed synthetic kernel message with controlled timing."""
+        msg = client.session.msg(kind, content=content, metadata=metadata or {})
+        msg["parent_header"] = {"msg_id": request_id}
+        msg["header"]["date"] = timestamp
+        await client.handle_document_related_message(client.session.serialize(msg)[1:])
+
+    def _timing_request(self, client, request_id="timed-request", enabled=True):
+        """Register the execution identity that owns a synthetic timing record."""
+        client.message_cache.add({
+            "msg_id": request_id, "channel": "shell", "cell_id": "test-cell-1",
+            "msg_type": "execute_request", "record_timing": enabled,
+        })
+
+    @pytest.mark.asyncio
+    async def test_server_timing_completes_without_browser(self, kernel_client_with_yroom):
+        """Kernel timestamps must reach the shared cell without a browser listener."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client)
+        _, cell = notebook.find_cell("test-cell-1")
+        cell["metadata"]["execution"] = {"shell.execute_reply": "2000-01-01T00:00:00Z"}
+        assert not client._listeners
+        await self._timing_message(client, "status", {"execution_state": "busy"}, "2026-10-27T10:00:00Z")
+        assert cell["metadata"]["execution"] == {"iopub.status.busy": "2026-10-27T10:00:00Z"}
+        await self._timing_message(client, "execute_input", {"execution_count": 3}, "2026-10-27T10:00:01Z")
+        await self._timing_message(client, "execute_reply", {"status": "ok", "execution_count": 3}, "2026-10-27T10:00:10Z", metadata={"started": "2026-10-27T10:00:01Z"})
+        await self._timing_message(client, "status", {"execution_state": "idle"}, "2026-10-27T10:00:11Z")
+        assert cell["metadata"]["execution"] == {
+            "iopub.status.busy": "2026-10-27T10:00:00Z",
+            "iopub.execute_input": "2026-10-27T10:00:01Z",
+            "shell.execute_reply.started": "2026-10-27T10:00:01Z",
+            "shell.execute_reply": "2026-10-27T10:00:10Z",
+            "iopub.status.idle": "2026-10-27T10:00:11Z",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["error", "abort"])
+    async def test_server_timing_records_failed_execution_completion(self, kernel_client_with_yroom, status):
+        """Error and aborted execute replies must have a recoverable finish time."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client)
+        await self._timing_message(client, "execute_reply", {"status": status}, "2026-10-27T10:00:10Z")
+        _, cell = notebook.find_cell("test-cell-1")
+        assert cell["metadata"]["execution"]["shell.execute_reply"] == "2026-10-27T10:00:10Z"
+
+    @pytest.mark.asyncio
+    async def test_server_timing_merges_concurrent_channels(self, kernel_client_with_yroom):
+        """Shell replies and IOPub completion must not replace each other's fields."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client)
+        await asyncio.gather(
+            self._timing_message(client, "execute_reply", {"status": "ok"}, "2026-10-27T10:00:10Z"),
+            self._timing_message(client, "status", {"execution_state": "idle"}, "2026-10-27T10:00:11Z"),
+        )
+        await self._timing_message(client, "status", {"execution_state": "busy"}, "2026-10-27T10:00:00Z")
+        _, cell = notebook.find_cell("test-cell-1")
+        timing = cell["metadata"]["execution"]
+        assert timing["shell.execute_reply"] == "2026-10-27T10:00:10Z"
+        assert timing["iopub.status.idle"] == "2026-10-27T10:00:11Z"
+        assert timing["iopub.status.busy"] == "2026-10-27T10:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_server_timing_respects_disabled_recording(self, kernel_client_with_yroom):
+        """An execution with recordTiming disabled must not gain timing metadata."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client, enabled=False)
+        await self._timing_message(client, "status", {"execution_state": "busy"}, "2026-10-27T10:00:00Z")
+        _, cell = notebook.find_cell("test-cell-1")
+        assert "execution" not in cell["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_server_timing_ignores_superseded_execution(self, kernel_client_with_yroom):
+        """Late messages from an older rerun must not overwrite the current timing."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client, request_id="old")
+        self._timing_request(client, request_id="new")
+        await self._timing_message(client, "status", {"execution_state": "busy"}, "2026-10-27T10:00:00Z", request_id="new")
+        await self._timing_message(client, "execute_reply", {"status": "ok"}, "2026-10-26T10:00:10Z", request_id="old")
+        _, cell = notebook.find_cell("test-cell-1")
+        assert cell["metadata"]["execution"] == {"iopub.status.busy": "2026-10-27T10:00:00Z"}
+
+    @pytest.mark.asyncio
+    async def test_server_timing_rerun_during_document_load(self, kernel_client_with_yroom):
+        """A rerun accepted during a document await must reject the old completion."""
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client, request_id="old")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_document():
+            entered.set()
+            await release.wait()
+            return notebook
+
+        room.get_jupyter_ydoc = AsyncMock(side_effect=delayed_document)
+        old_reply = asyncio.create_task(self._timing_message(
+            client, "execute_reply", {"status": "ok"}, "2026-10-26T10:00:10Z", request_id="old",
+        ))
+        await entered.wait()
+        self._timing_request(client, request_id="new")
+        release.set()
+        await old_reply
+        _, cell = notebook.find_cell("test-cell-1")
+        assert "execution" not in cell["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_server_timing_missing_header_date_uses_utc(self, kernel_client_with_yroom):
+        """Older kernels lacking message dates must still produce UTC timing."""
+        from datetime import datetime
+        client, room, notebook = kernel_client_with_yroom
+        self._timing_request(client)
+        await self._timing_message(client, "execute_reply", {"status": "ok"}, None)
+        _, cell = notebook.find_cell("test-cell-1")
+        timestamp = cell["metadata"]["execution"]["shell.execute_reply"]
+        assert timestamp.endswith("Z")
+        assert datetime.fromisoformat(timestamp.replace("Z", "+00:00")).utcoffset().total_seconds() == 0
+
     @pytest.mark.asyncio
     async def test_stream_output_message_processed(self, kernel_client_with_yroom):
         """Test that stream output messages are processed correctly."""

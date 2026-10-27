@@ -1,8 +1,11 @@
+"""Store cell output payloads and preserve live results during source reloads."""
+
 import json
 import os
 from pathlib import Path, PurePath
 import shutil
 import uuid
+from copy import deepcopy
 
 from pycrdt import Map
 import nbformat
@@ -81,6 +84,7 @@ class OutputsManager(LoggingConfigurable):
     - Always saves outputs to notebook files
     - Keeps outputs out of YDoc using placeholders
     - Stores outputs in runtime directory for HTTP access
+    - Preserves live execution fields when external source edits are reconciled
     """
     _last_output_index = Dict(default_value={})
     _output_index_by_display_id = Dict(default_value={})
@@ -341,19 +345,30 @@ class OutputsManager(LoggingConfigurable):
             placeholder = Map(placeholder)
         return placeholder
 
-    def process_loaded_notebook(self, file_id: str, file_data: dict) -> dict:
+    def process_loaded_notebook(self, file_id: str, file_data: dict, *, live_notebook: dict | None = None) -> dict:
         """Process a loaded notebook and handle outputs through the outputs manager.
 
         This method processes a notebook that has been loaded from disk.
-        In base mode, outputs are always processed from the file.
+        Initial loads import outputs from the file. When ``live_notebook`` is
+        supplied for an external edit, existing code-cell IDs retain their live
+        output references, execution count, and execution timing; the file owns
+        source, cell ordering, and other metadata. New code cells import their
+        outputs normally. Existing output files are not cleared in this mode.
 
         Args:
             file_id (str): The file identifier
             file_data (dict): The file data containing the notebook content
                 from calling ContentsManager.get()
+            live_notebook (dict | None): Current shared notebook snapshot for an
+                external-edit reconciliation, or None for an initial load.
 
         Returns:
             dict: The modified file data with processed outputs
+
+        Raises:
+            Notebook-format or output-processing errors may propagate. The
+            input file_data is modified, and newly imported output files are
+            written to the output service's storage directory.
         """
         # Notebook content is a tree of nbformat.NotebookNode objects,
         # which are a subclass of dict.
@@ -361,6 +376,11 @@ class OutputsManager(LoggingConfigurable):
         # We need cell ids which are only in nbformat >4.5. We use this to
         # upgrade all notebooks to 4.5 or later
         nb = self._upgrade_notebook_format(nb)
+        live_cells = {
+            cell["id"]: cell
+            for cell in (live_notebook or {}).get("cells", [])
+            if cell.get("id") and cell.get("cell_type") == "code"
+        }
 
         for cell in nb.get('cells', []):
             # Ensure all cells have IDs regardless of type
@@ -370,6 +390,18 @@ class OutputsManager(LoggingConfigurable):
                 continue
 
             cell_id = cell['id']
+
+            if cell_id in live_cells:
+                live = live_cells[cell_id]
+                cell["outputs"] = deepcopy(live.get("outputs", []))
+                cell["execution_count"] = live.get("execution_count")
+                metadata = cell.setdefault("metadata", {})
+                execution = live.get("metadata", {}).get("execution")
+                if execution is None:
+                    metadata.pop("execution", None)
+                else:
+                    metadata["execution"] = deepcopy(execution)
+                continue
 
             # Clear existing outputs for this cell to avoid stale data
             self.clear(file_id, cell_id)

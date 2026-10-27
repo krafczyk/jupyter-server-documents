@@ -1,3 +1,5 @@
+"""Synchronize document rooms and restore their execution routing on connect."""
+
 from __future__ import annotations
 from tornado.httpclient import HTTPError
 from tornado.websocket import WebSocketHandler
@@ -12,6 +14,12 @@ if TYPE_CHECKING:
     from ..rooms import YRoom
 
 class YRoomWebsocket(WebSocketHandler):
+    """Serve a room and reconnect its existing notebook kernel bindings.
+
+    Accepts Tornado's standard WebSocket handler constructor arguments. Failed
+    reattachment unregisters the new client and closes its connection with code
+    1011; kernel processes and other clients are not shut down.
+    """
     yroom: YRoom
     room_id: str
     client_id: str | None
@@ -55,7 +63,14 @@ class YRoomWebsocket(WebSocketHandler):
                 raise HTTPError(404, f"No file with ID '{fileid}'.")
     
 
-    def open(self, *_, **__):
+    async def open(self, *_, **__):
+        """Register this client and restore a notebook room's execution routing.
+
+        Unused route arguments are accepted for Tornado compatibility. Returns
+        ``None``; initialization/binding errors propagate after client cleanup.
+        Session managers without a reconnection hook retain their old behavior.
+        """
+        self.client_id = None
         # Create the YRoom
         yroom = self.yroom_manager.get_room(self.room_id)
         if not yroom:
@@ -69,6 +84,17 @@ class YRoomWebsocket(WebSocketHandler):
         if not self.client_id:
             self.close(code=1001)
             return
+
+        session_manager = self.settings.get("session_manager")
+        reconnect = getattr(session_manager, "reconnect_yroom", None)
+        if self.room_id.startswith("json:notebook:") and reconnect is not None:
+            try:
+                await reconnect(self.yroom)
+            except Exception:
+                self.yroom.clients.remove(self.client_id)
+                self.client_id = None
+                self.close(code=1011, reason="Unable to reconnect notebook execution")
+                raise
 
 
     def on_message(self, message: bytes):

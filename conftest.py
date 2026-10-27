@@ -34,7 +34,10 @@ def pytest_configure(config):
 @pytest.fixture
 def jp_server_config(jp_server_config, tmp_path):
     """
-    Fixture that defines the traitlets configuration used in unit tests.
+    Define test server configuration with all file-ID state under ``tmp_path``.
+
+    The file-ID dependency computes its default database path at import time,
+    before Jupyter's fixtures isolate the data directory, so set it explicitly.
     """
 
     return Config({
@@ -45,7 +48,8 @@ def jp_server_config(jp_server_config, tmp_path):
             },
             "root_dir": str(tmp_path)
         },
-        "ContentsManager": {"root_dir": str(tmp_path)}
+        "ContentsManager": {"root_dir": str(tmp_path)},
+        "BaseFileIdManager": {"db_path": str(tmp_path / "file_ids.sqlite")},
     })
 
 class MockServerDocsApp(LoggingConfigurable):

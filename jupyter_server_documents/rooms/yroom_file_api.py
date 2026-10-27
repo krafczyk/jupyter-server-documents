@@ -1,7 +1,14 @@
+"""Persist shared documents and reconcile external notebook source edits.
+
+Existing cell IDs retain live output, count, and timing during external reloads;
+new cells and source changes are synchronized through the normal Y-document.
+"""
+
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import asyncio
 import time
+from copy import deepcopy
 from datetime import datetime
 from jupyter_ydoc.ybasedoc import YBaseDoc
 from jupyter_server.utils import ensure_async
@@ -19,6 +26,16 @@ if TYPE_CHECKING:
 
 DEFAULT_MIN_POLL_INTERVAL = 0.5
 DEFAULT_POLL_INTERVAL_MULTIPLIER = 5.0
+
+
+def _cell_edit_states(notebook: dict) -> dict:
+    """Snapshot source/type by stable ID without retaining large output data."""
+    return {
+        cell["id"]: (cell.get("cell_type"), cell.get("source", ""))
+        for cell in notebook.get("cells", []) if cell.get("id")
+    }
+
+
 class YRoomFileAPI(LoggingConfigurable):
     """Provides an API to interact with a single file for a YRoom.
 
@@ -28,6 +45,7 @@ class YRoomFileAPI(LoggingConfigurable):
     - Saving YDoc changes back to the filesystem with adaptive timing
     - Detecting and responding to in-band and out-of-band file changes
     - Managing notebook outputs through the OutputsManager
+    - Applying external source edits without replacing live execution fields
 
     Usage:
         1. Create instance with parent YRoom: `file_api = YRoomFileAPI(parent=yroom)`
@@ -149,6 +167,8 @@ class YRoomFileAPI(LoggingConfigurable):
         self._save_scheduled = False
         self._last_path = None
         self._last_modified = None
+        self._disk_cells = {}
+        self._external_change_pending = False
         self._stopped = False
         self._is_writable = True
 
@@ -265,6 +285,34 @@ class YRoomFileAPI(LoggingConfigurable):
         """
         return self._reloading_content
 
+    @property
+    def external_change_pending(self) -> bool:
+        """Whether a detected external change still needs reconciliation.
+
+        Returns bool. While true, saves must not overwrite the external file and
+        idle-room collection must retain the live version. The flag clears when
+        a complete, nonconflicting external version is applied.
+        """
+        return self._external_change_pending
+
+    async def reconcile_before_save(self, jupyter_ydoc: YBaseDoc) -> None:
+        """Check for external changes before saving or releasing a notebook room.
+
+        ``jupyter_ydoc`` is the current live document. Returns None after any
+        detected change is merged. ContentsManager I/O/HTTP errors and source
+        conflicts propagate before writing; no kernel code is executed.
+        """
+        if self.file_type != "notebook" or not self.content_loaded:
+            return
+        path = self.get_path()
+        if not path:
+            raise RuntimeError("Cannot save a notebook whose file ID has no path.")
+        self._last_path = path
+        async with self._content_lock:
+            metadata = await ensure_async(self.contents_manager.get(path, content=False))
+        if self._external_change_pending or metadata["last_modified"] != self._last_modified:
+            await self._reload_content_inplace(jupyter_ydoc)
+
 
     @property
     def until_content_loaded(self) -> Coroutine[Any, Any, Literal[True]]:
@@ -305,7 +353,7 @@ class YRoomFileAPI(LoggingConfigurable):
         asyncio.create_task(self._load_content(jupyter_ydoc))
 
 
-    async def _get_content(self, path: str) -> tuple[Any, datetime]:
+    async def _get_content(self, path: str, *, live_notebook: YBaseDoc | None = None) -> tuple[Any, datetime]:
         """Fetch file content from ContentsManager and return (content, last_modified).
 
         Fetches the file at `path`, updates `_is_writable`, processes notebook
@@ -316,6 +364,9 @@ class YRoomFileAPI(LoggingConfigurable):
 
         Args:
             path: Filesystem path relative to ServerApp.root_dir.
+            live_notebook: Shared notebook to reconcile after reading an
+                external edit. Its latest snapshot is taken after the read so
+                kernel output arriving during file I/O is retained.
 
         Returns:
             A tuple of (content, last_modified) where `content` is the
@@ -334,7 +385,24 @@ class YRoomFileAPI(LoggingConfigurable):
         self._is_writable = file_data.get('writable', True)
 
         if self.file_type == "notebook":
-            file_data = self.outputs_manager.process_loaded_notebook(file_id=self.file_id, file_data=file_data)
+            disk_cells = _cell_edit_states(file_data["content"])
+            live_source = live_notebook.source if live_notebook is not None else None
+            if live_source is not None:
+                self._reconcile_notebook_sources(file_data["content"], live_source)
+                states = dict(self.parent.get_cell_execution_states())
+                awareness = self.parent.get_awareness().get_local_state() or {}
+                states.update(awareness.get("cell_execution_states", {}))
+                running = {cell_id for cell_id, state in states.items() if state in {"busy", "running"}}
+                incoming = {
+                    cell.get("id") for cell in file_data["content"].get("cells", [])
+                    if cell.get("cell_type") == "code"
+                }
+                if running - incoming:
+                    raise ValueError("External edit removes or changes IDs of running notebook cells; retain their cell IDs until execution finishes.")
+            file_data = self.outputs_manager.process_loaded_notebook(
+                file_id=self.file_id, file_data=file_data, live_notebook=live_source,
+            )
+            self._disk_cells = disk_cells
 
         # Replace CRLF line terminators with LF line terminators
         # Fixes #176, see issue description for more context.
@@ -345,6 +413,49 @@ class YRoomFileAPI(LoggingConfigurable):
             self.log.info("Replaced CRLF line terminators with LF line terminators.")
 
         return content, file_data['last_modified']
+
+    def _reconcile_notebook_sources(self, incoming: dict, live: dict) -> None:
+        """Merge disjoint source/addition edits against the last observed file.
+
+        Conflicting edits to the same cell raise ValueError before any output
+        files are changed. Live additions and deletions are retained when the
+        external snapshot has not changed those cells. External ordering wins
+        for shared cell IDs; concurrent ordering edits need a coordinated API.
+        """
+        cells = incoming.get("cells", [])
+        ids = [cell["id"] for cell in cells if cell.get("id")]
+        if len(ids) != len(set(ids)):
+            raise ValueError("External notebook contains duplicate cell IDs.")
+        incoming_states = _cell_edit_states(incoming)
+        live_states = _cell_edit_states(live)
+        live_cells = {cell["id"]: cell for cell in live.get("cells", []) if cell.get("id")}
+        merged = []
+        for cell in cells:
+            cell_id = cell.get("id")
+            external = incoming_states.get(cell_id)
+            current = live_states.get(cell_id)
+            baseline = self._disk_cells.get(cell_id)
+            if baseline is not None:
+                external_changed = external != baseline
+                live_changed = current != baseline
+                if external_changed and live_changed and external != current:
+                    raise ValueError(f"Conflicting source edits for notebook cell '{cell_id}'.")
+                if not external_changed and live_changed:
+                    if current is None:
+                        continue
+                    cell["cell_type"], cell["source"] = current
+            elif current is not None and current != external:
+                raise ValueError(f"Conflicting additions for notebook cell '{cell_id}'.")
+            merged.append(cell)
+        for cell_id, current in live_states.items():
+            if cell_id in incoming_states:
+                continue
+            baseline = self._disk_cells.get(cell_id)
+            if baseline is None:
+                merged.append(deepcopy(live_cells[cell_id]))
+            elif current != baseline:
+                raise ValueError(f"Conflicting deletion of edited notebook cell '{cell_id}'.")
+        incoming["cells"] = merged
 
     async def _load_content(self, jupyter_ydoc: YBaseDoc) -> None:
         """Internal method to load file content asynchronously.
@@ -533,7 +644,7 @@ class YRoomFileAPI(LoggingConfigurable):
         # Finally, if the file was not moved/deleted, check for out-of-band
         # changes to the file content using the metadata.
         # If an out-of-band file change is detected, run the designated callback.
-        if self._last_modified != file_data['last_modified']:
+        if self._external_change_pending or self._last_modified != file_data['last_modified']:
             self.log.warning(
                 "Out-of-band file change detected. "
                 f"Room ID: '{self.room_id}', "
@@ -552,9 +663,11 @@ class YRoomFileAPI(LoggingConfigurable):
         (`_on_ydoc_update`) will broadcast the diff to all connected clients so they
         stay in sync without reconnecting.
 
-        A `_reloading_content` flag is held for the duration of the ydoc write so
-        that `_on_jupyter_ydoc_update` does not schedule a save-back to disk (which
-        would cause an infinite reload loop via the `last_modified` check).
+        A `_reloading_content` flag suppresses intermediate automatic saves.
+        Notebook reloads then schedule one save of the merged source/execution
+        state; its acknowledged last_modified prevents a reload feedback loop.
+        Conflicting source edits or removal of running cells raise ValueError
+        before changing the shared document or output cache.
 
         Args:
             jupyter_ydoc: The live YBaseDoc instance to update in-place.
@@ -565,7 +678,10 @@ class YRoomFileAPI(LoggingConfigurable):
 
         self.log.info(f"Reloading content in-place for room ID '{self.room_id}' at path: '{path}'.")
 
-        content, last_modified = await self._get_content(path)
+        self._external_change_pending = True
+        content, last_modified = await self._get_content(
+            path, live_notebook=jupyter_ydoc if self.file_type == "notebook" else None,
+        )
 
         # Set the flag before writing so _on_jupyter_ydoc_update skips
         # schedule_save() for this update.  The assignment is synchronous so
@@ -578,6 +694,9 @@ class YRoomFileAPI(LoggingConfigurable):
             self._reloading_content = False
 
         self._last_modified = last_modified
+        self._external_change_pending = False
+        if self.file_type == "notebook":
+            self.schedule_save()
         self.log.info(f"Reloaded content in-place for room ID '{self.room_id}'.")
 
 
@@ -597,11 +716,21 @@ class YRoomFileAPI(LoggingConfigurable):
         Args:
             jupyter_ydoc: The YBaseDoc instance to save.
 
+        Returns:
+            None after the save attempt. Write failures are logged and scheduled
+            for retry by the existing watcher.
+
+        Raises:
+            External source conflicts and preflight read errors propagate before
+            writing, including during final cleanup. Resolve external changes
+            before discarding the live document or stopping the server.
+
         Note:
             In normal operation, consumers should use schedule_save() instead.
             Only call this directly when you need an immediate save while the
             FileAPI is stopped (e.g., during room shutdown).
         """
+        await self.reconcile_before_save(jupyter_ydoc)
         # Record start time for adaptive timing
         start_time = time.perf_counter()
 
@@ -633,6 +762,9 @@ class YRoomFileAPI(LoggingConfigurable):
                     },
                     path
                 ))
+
+            if self.file_type == "notebook":
+                self._disk_cells = _cell_edit_states(content)
 
             # Set most recent `last_modified` timestamp
             if file_data['last_modified']:
@@ -712,6 +844,8 @@ class YRoomFileAPI(LoggingConfigurable):
         self._save_scheduled = False
         self._last_modified = None
         self._last_path = None
+        self._disk_cells = {}
+        self._external_change_pending = False
 
         # Reset adaptive timing attributes
         self._adaptive_poll_interval = self.min_poll_interval

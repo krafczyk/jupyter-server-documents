@@ -1,4 +1,7 @@
+"""Bind notebook rooms to surviving kernels when document clients reconnect."""
+
 import os
+from weakref import WeakKeyDictionary, WeakSet
 from typing import Optional, Any
 from jupyter_server.services.sessions.sessionmanager import SessionManager, KernelName, ModelName
 from jupyter_server.serverapp import ServerApp
@@ -6,11 +9,15 @@ from jupyter_server_fileid.manager import BaseFileIdManager
 from jupyter_server_documents.rooms.yroom_manager import YRoomManager
 from jupyter_server_documents.rooms.yroom import YRoom
 from jupyter_server_documents.kernels.kernel_client import DocumentAwareKernelClient
+from tornado.web import HTTPError
 
 
 class YDocSessionManager(SessionManager): 
-    """A Jupyter Server Session Manager that connects YDocuments
-    to Kernel Clients.
+    """Connect notebook sessions and collaborative rooms to existing kernels.
+
+    Constructor arguments are forwarded to Jupyter Server's ``SessionManager``.
+    Room cleanup releases output routing while retaining sessions and kernels;
+    reconnecting clients restore routing to the replacement room.
     """
     
     @property
@@ -44,6 +51,39 @@ class YDocSessionManager(SessionManager):
         super().__init__(*args, **kwargs)
         self._room_ids = {}
         self._console_session_ids = set()
+        self._room_kernel_clients = WeakKeyDictionary()
+
+    async def _connect_yroom(self, yroom: YRoom, kernel_client: DocumentAwareKernelClient) -> None:
+        """Attach routing with one cleanup callback per room/client pair.
+
+        Weak tracking avoids retaining collected rooms or obsolete clients just
+        to deduplicate their callbacks. Binding errors propagate to the caller.
+        """
+        await kernel_client.add_yroom(yroom)
+        clients = self._room_kernel_clients.setdefault(yroom, WeakSet())
+        if kernel_client not in clients:
+            clients.add(kernel_client)
+            yroom.add_stop_callback(lambda: kernel_client.remove_yroom(yroom))
+
+    async def reconnect_yroom(self, yroom: YRoom) -> None:
+        """Restore existing notebook sessions' output routing to ``yroom``.
+
+        Only sessions already mapped to this room ID are considered. Missing
+        sessions (HTTP 404) are skipped; other lookup or binding failures
+        propagate. Returns ``None`` after attachment. This neither creates a
+        session/kernel nor changes its identity or executes notebook code.
+        """
+        for session_id, room_id in tuple(self._room_ids.items()):
+            if room_id != yroom.room_id:
+                continue
+            try:
+                model = await self.get_session(session_id=session_id)
+            except HTTPError as error:
+                if error.status_code == 404:
+                    continue
+                raise
+            kernel_client = self.get_kernel_client(model["kernel"]["id"])
+            await self._connect_yroom(yroom, kernel_client)
 
     def get_kernel_client(self, kernel_id: str) -> DocumentAwareKernelClient:
         """Get the kernel client for a running kernel."""
@@ -91,8 +131,13 @@ class YDocSessionManager(SessionManager):
         kernel_name: Optional[KernelName] = None,
         kernel_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        """
-        After creating a session, connects the yroom to the kernel client.
+        """Create a Jupyter session and attach its notebook room to the kernel.
+
+        ``path``/``name`` identify the document, ``type`` selects notebook or
+        console behavior, and ``kernel_name`` or ``kernel_id`` select a new or
+        existing kernel as in ``SessionManager.create_session``. Returns its
+        session-model dictionary. Parent creation and binding errors propagate.
+        Notebook room cleanup detaches routing without deleting this session.
         """
         session_model = await super().create_session(
             path,
@@ -146,20 +191,19 @@ class YDocSessionManager(SessionManager):
         # kernel client instantiated _before_ trying to connect
         # the yroom.
         kernel_client = self.get_kernel_client(kernel_id)
-        await kernel_client.add_yroom(yroom)
-        yroom.add_stop_callback(lambda: kernel_client.remove_yroom(yroom))
+        await self._connect_yroom(yroom, kernel_client)
         self.log.info(f"Connected yroom {yroom.room_id} to kernel {kernel_id}. yroom: {yroom}")
         return session_model
     
 
     async def update_session(self, session_id: str, **update) -> None:
-        """
-        Updates the session identified by `session_id` using the keyword
-        arguments passed to this method. Each keyword argument should correspond
-        to a column in the sessions table.
+        """Update session columns and any changed notebook-to-kernel binding.
 
-        This class calls the `update_session()` parent method, then updates the
-        kernel client if `update` contains `kernel_id`.
+        ``session_id`` identifies an existing session; ``update`` contains
+        Jupyter session column values. A supplied ``kernel_id`` refreshes the
+        room binding even when unchanged and registers replacement-room cleanup.
+        Returns ``None``. Parent lookup/update and binding errors propagate.
+        Kernel process lifetime remains the caller's responsibility.
         """
         # Apply update and return early if `kernel_id` was not updated
         if "kernel_id" not in update:
@@ -172,7 +216,7 @@ class YDocSessionManager(SessionManager):
         # Otherwise, first remove the YRoom from the old kernel client and add
         # the YRoom to the new kernel client, before applying the update.
         old_session_info = (await self.get_session(session_id=session_id) or {})
-        old_kernel_id = old_session_info.get("kernel_id", None)
+        old_kernel_id = old_session_info.get("kernel", {}).get("id")
         new_kernel_id = update.get("kernel_id", None)
         self.log.info(
             f"Updating session '{session_id}' from kernel '{old_kernel_id}' "
@@ -184,7 +228,7 @@ class YDocSessionManager(SessionManager):
             await old_kernel_client.remove_yroom(yroom=yroom)
         if new_kernel_id:
             new_kernel_client = self.get_kernel_client(new_kernel_id)
-            await new_kernel_client.add_yroom(yroom=yroom)
+            await self._connect_yroom(yroom, new_kernel_client)
 
         # Apply update and return
         return await super().update_session(session_id, **update)

@@ -1,10 +1,13 @@
-"""
-A new Kernel client that is aware of ydocuments.
+"""Route kernel output, execution state, and enabled timing into shared cells.
+
+Timing is collected from kernel messages independently of browser listeners and
+saved by the collaborative document's normal persistence path.
 """
 import anyio
 import asyncio
 import json
 import typing as t
+from datetime import datetime, timezone
 
 from traitlets import Set, Instance, Any, Type, default
 from jupyter_client.asynchronous.client import AsyncKernelClient
@@ -18,8 +21,11 @@ from .kernel_client_abc import AbstractDocumentAwareKernelClient
 
 
 class DocumentAwareKernelClient(AsyncKernelClient):
-    """
-    A kernel client that routes messages to registered ydocs.
+    """Route kernel messages to notebook rooms and connected clients.
+
+    Accepts ``AsyncKernelClient`` constructor options. Requests carrying
+    ``recordTiming`` enable server-owned execution metadata for their cell.
+    Kernel header timestamps are preferred, with UTC receipt time as fallback.
     """
     # Having this message cache is not ideal.
     # Unfortunately, we don't include the parent channel
@@ -42,6 +48,7 @@ class DocumentAwareKernelClient(AsyncKernelClient):
     # A set of YRooms that will intercept output and kernel
     # status messages.
     _yrooms: t.Set[YRoom] = Set(trait=Instance(YRoom), default_value=set())
+    _timing_lock = Instance(asyncio.Lock, args=())
 
 
     output_processor = Instance(
@@ -135,7 +142,9 @@ class DocumentAwareKernelClient(AsyncKernelClient):
         self.message_cache.add({
             "msg_id": msg_id,
             "channel": channel_name,
-            "cell_id": cell_id
+            "cell_id": cell_id,
+            "msg_type": msg_type,
+            "record_timing": metadata.get("recordTiming", False),
         })
         channel = getattr(self, f"{channel_name}_channel")
         if channel.socket is None:
@@ -226,6 +235,12 @@ class DocumentAwareKernelClient(AsyncKernelClient):
         """
         Processes document-related messages received from a Jupyter kernel.
         
+        ``msg`` is a signed multipart kernel message after identity/delimiter
+        removal. Deserialization or document-update failures propagate to the
+        listening loop for logging. No notebook code is executed here.
+        Enabled execution timing is written to the shared cell even when no
+        browser is connected, replacing older-run timing on the first event.
+
         Messages are deserialized and handled based on their type. Supported message types
         include updating language info, kernel status, execution state, execution count,
         and various output types. Some messages may be processed by an output processor
@@ -250,6 +265,12 @@ class DocumentAwareKernelClient(AsyncKernelClient):
 
         # Safely extract cell_id
         cell_id = parent_msg_data.get('cell_id') if parent_msg_data else None
+
+        if cell_id and parent_msg_data.get("record_timing") and parent_msg_data.get("msg_type") == "execute_request":
+            await self._record_execution_timing(dmsg, parent_msg_data)
+            if self.message_cache.get(parent_msg_id) is not parent_msg_data:
+                cell_id = None
+                parent_msg_data = None
 
         # Handle different message types using pattern matching
         match dmsg["msg_type"]:
@@ -317,6 +338,46 @@ class DocumentAwareKernelClient(AsyncKernelClient):
 
         # Default return if message is processed and does not need forwarding
         return msg
+
+    async def _record_execution_timing(self, message: dict, request: dict) -> None:
+        """Merge one correlated kernel timing event into its current shared cell.
+
+        Shell and IOPub listeners run independently, so updates are serialized.
+        The request-local snapshot prevents previous-run or browser metadata
+        from supplying stale completion fields. Non-timing messages are ignored.
+        """
+        kind = message["msg_type"]
+        if kind == "status":
+            state = self.session.unpack(message["content"]).get("execution_state")
+            if state not in {"busy", "idle"}:
+                return
+            key = f"iopub.status.{state}"
+        elif kind == "execute_input":
+            key = "iopub.execute_input"
+        elif kind == "execute_reply":
+            key = "shell.execute_reply"
+        else:
+            return
+
+        timestamp = message["header"].get("date") or datetime.now(timezone.utc)
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.isoformat().replace("+00:00", "Z")
+
+        async with self._timing_lock:
+            if self.message_cache.get(request["msg_id"]) is not request:
+                return
+            timing = request.setdefault("timing", {})
+            timing[key] = timestamp
+            if kind == "execute_reply" and message["metadata"].get("started"):
+                timing["shell.execute_reply.started"] = message["metadata"]["started"]
+            for room in self._yrooms:
+                notebook = await room.get_jupyter_ydoc()
+                if self.message_cache.get(request["msg_id"]) is not request:
+                    return
+                _, cell = notebook.find_cell(request["cell_id"])
+                if cell is not None:
+                    cell["metadata"]["execution"] = dict(timing)
+                    break
 
     async def add_yroom(self, yroom: YRoom):
         """

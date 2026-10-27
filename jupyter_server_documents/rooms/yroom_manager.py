@@ -1,3 +1,5 @@
+"""Manage document rooms while protecting active work and unresolved edits."""
+
 from __future__ import annotations
 
 from .yroom import YRoom
@@ -24,9 +26,10 @@ class YRoomManager(LoggingConfigurable):
     A singleton that manages all `YRoom` instances in the server extension. The
     constructor requires only a single argument `parent: ExtensionApp`.
 
-    This manager automatically restarts updated `YRoom` instances if they have
-    had no connected clients or active kernel for >10 seconds. This deletes the
-    YDoc history to free its memory to the server.
+    Configured inactivity/GC intervals reclaim rooms with no connected clients
+    or active kernel execution. Notebook files are reconciled before collection;
+    unresolved external changes retain the live room instead of being overwritten
+    by a final save. Failed preflight reads are logged and collection is deferred.
     """
 
     yroom_class = traitlets.Type(
@@ -312,7 +315,11 @@ class YRoomManager(LoggingConfigurable):
         without a connected kernel, or the kernel was shut down externally.
 
         - See `YRoom.inactive` for details on how activity is measured.
+        - Pending external edits/conflicts retain the live room until reconciled.
         """
+        file_api = getattr(room, "file_api", None)
+        if file_api is not None and file_api.external_change_pending is True:
+            return False
         if not room.room_id.startswith("json:notebook:"):
             if self.show_gc_debug and room.empty and not room.inactive:
                 self.log.info(f"Not freeing room '{room.room_id}' because it is not yet inactive.")
@@ -334,9 +341,20 @@ class YRoomManager(LoggingConfigurable):
 
     async def _free_room(self, room: YRoom) -> bool:
         """
-        Frees a room from memory by deleting it. This is the same as
-        `delete_room()`, but logs when the room is freed.
+        Reconcile external notebook changes, then collect an eligible room.
+
+        Conflicts/I/O failures retain the live room and return False. Eligibility
+        is checked again after asynchronous reads so a newly active room is not
+        stopped. No kernels are started or shut down by this operation.
         """
+        if room.room_id.startswith("json:notebook:") and room.file_api:
+            try:
+                await room.file_api.reconcile_before_save(await room.get_jupyter_ydoc())
+            except Exception:
+                self.log.exception("Keeping notebook room with unresolved external changes: '%s'.", room.room_id)
+                return False
+            if not self._should_free_room(room):
+                return False
         self.log.info(f"Freeing room '{room.room_id}'.")
 
         # Capture room_id as a string so the finalizer callback doesn't
@@ -421,5 +439,3 @@ class YRoomManager(LoggingConfigurable):
                 f"{room_count} YRooms."
             )
         
-
-

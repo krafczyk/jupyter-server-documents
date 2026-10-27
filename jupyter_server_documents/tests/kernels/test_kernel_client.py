@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from jupyter_server_documents.kernels.kernel_client import DocumentAwareKernelClient
 from jupyter_server_documents.kernels.message_cache import KernelMessageCache
@@ -18,6 +18,25 @@ class TestDocumentAwareKernelClient:
         """Test that output processor is created by default."""
         client = DocumentAwareKernelClient()
         assert isinstance(client.output_processor, OutputProcessor)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_execute_request_caches_timing_preference(self, enabled):
+        """The actual request path must retain recordTiming for offline replies."""
+        import asyncio
+        client = DocumentAwareKernelClient()
+        request = client.session.msg(
+            "execute_request", content={"code": "1"},
+            metadata={"cellId": "cell-1", "recordTiming": enabled},
+        )
+        channel = MagicMock()
+        client.output_processor.clear_cell_outputs = AsyncMock()
+        with patch.object(type(client), "shell_channel", new_callable=PropertyMock, return_value=channel):
+            client.handle_incoming_message("shell", client.session.serialize(request)[2:])
+        await asyncio.sleep(0)
+        cached = client.message_cache.get(request["header"]["msg_id"])
+        assert cached["record_timing"] is enabled
+        assert cached["msg_type"] == "execute_request"
 
     @pytest.mark.asyncio
     async def test_stop_listening_no_task(self):

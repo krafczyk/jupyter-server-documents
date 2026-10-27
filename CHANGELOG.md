@@ -2,6 +2,20 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## 0.2.5+mkchad.1
+
+### Bugs fixed
+
+- Restore a recreated notebook room's binding to its existing kernel when a
+  document client reconnects; deduplicate cleanup callbacks across clients.
+- Record enabled execution timing on the server, including completion while
+  browsers are disconnected, without retaining an older run's finish time.
+- Reconcile external notebook source edits and additions without reverting live
+  output, execution counts, timing, or unrelated browser source changes.
+- Preserve conflicting source versions and reject removal of running cells
+  instead of silently losing work during an external reload.
+- Isolate the test file-ID database from the user's Jupyter data directory.
+
 ## 0.2.5
 
 ([Full Changelog](https://github.com/jupyter-ai-contrib/jupyter-server-documents/compare/v0.2.4...484803e7544b61fe89d68e73b6ffaeca7042bf4c))

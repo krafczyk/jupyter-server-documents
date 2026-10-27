@@ -1,5 +1,8 @@
 # Jupyter Server Documents
 
+The MkChad maintenance build's behavior, requirements, and deployment notes are
+documented in [Notebook recovery and external edits](docs/recovery.md).
+
 This extension is composed of a Python package named `jupyter_server_documents`
 for the server extension and a NPM package named `@jupyter-ai-contrib/server-documents`
 for the frontend extension.
