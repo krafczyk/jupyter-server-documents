@@ -110,7 +110,8 @@ same cell's existing output payload. It does not infer trust from external-file
 metadata, promote an unknown/untrusted retained output, or trust newly imported
 outputs. Standard notebook trust decisions still govern new external content.
 
-For an affected existing view, the normal **File → Trust Notebook** action can
+For an affected existing view in Lab 4.5.9, select the notebook, open **View →
+Activate Command Palette**, and search for **Trust Notebook**. That command can
 re-render the user's retained HTML/JavaScript outputs after explicit confirmation.
 It does not resubmit the cell's Python execution. Already-untrusted shared state
 is not automatically promoted by installing the follow-up: an explicit trust
