@@ -1,6 +1,6 @@
 # Notebook recovery and external edits
 
-The MkChad maintenance build `0.2.5+mkchad.1` restores execution routing after
+The MkChad maintenance build `0.2.5+mkchad.2` restores execution routing after
 notebook room cleanup, records timing on the server, and reconciles external
 notebook source edits. It targets ordinary JupyterLab use and OpenCode file-tool
 edits; Jupyter AI-specific behavior is not required.
@@ -60,6 +60,9 @@ document and broadcasts its CRDT update to connected clients:
 - Source/type changes and new cells are incorporated without executing code.
 - Existing code-cell IDs keep live output references, execution counts, and
   execution metadata. An older disk snapshot cannot replace newer results.
+  The retained output's existing trust status is preserved too. New external
+  outputs do not inherit that trust, and previously untrusted outputs remain
+  untrusted even if external metadata claims otherwise.
 - Source is compared with the last observed/saved file. Disjoint cell edits
   merge, and unchanged fields in an older snapshot do not undo browser edits.
 - Conflicting source/type edits to the same cell, or deletion of an edited
@@ -93,6 +96,32 @@ concurrent cell reordering or same-cell edits through separate writers. For
 transactional concurrent editing, use a tool that updates the live document API.
 The reconciliation applies to detected external changes; it cannot recover an
 external file version overwritten by another writer before detection.
+
+## hvPlot/HTML on a fresh client after a file edit
+
+Version `0.2.5+mkchad.1` preserved output payloads across an external edit but
+failed to retain their trust metadata. The original browser could keep its
+already-trusted output model while the shared document was marked untrusted.
+A fresh browser then sanitized/blocked HTML and JavaScript, leaving hvPlot blank
+despite complete saved HoloViews MIME bundles and working stdout.
+
+Version `0.2.5+mkchad.2` preserves the live trust flag only when preserving that
+same cell's existing output payload. It does not infer trust from external-file
+metadata, promote an unknown/untrusted retained output, or trust newly imported
+outputs. Standard notebook trust decisions still govern new external content.
+
+For an affected existing view, the normal **File → Trust Notebook** action can
+re-render the user's retained HTML/JavaScript outputs after explicit confirmation.
+It does not resubmit the cell's Python execution. Already-untrusted shared state
+is not automatically promoted by installing the follow-up: an explicit trust
+decision or a subsequent intentional execution is needed for that state.
+
+The isolated browser regression uses two real hvPlot/Bokeh plots. It checks
+offline completion, an external source edit, a second fresh mobile-sized client,
+actual rendered plot canvases, and continued use of the same kernel. The old
+build reproducibly showed `model.trusted = false` and no canvases on that second
+client; the follow-up retains trust and renders them. Negative backend tests
+verify that untrusted retained and newly imported outputs do not gain trust.
 
 ## Recovery limits and deployment
 

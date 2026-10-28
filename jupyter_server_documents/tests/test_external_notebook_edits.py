@@ -167,3 +167,28 @@ async def test_conflicting_external_source_edits_preserve_both_versions(mock_ser
     await room.file_api._check_file(shared)
     await room.file_api.save(shared)
     assert not room.file_api.external_change_pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_trust", [True, False, None])
+async def test_external_source_edit_preserves_only_existing_output_trust(mock_server_docs_app, live_trust):
+    """Fresh clients need retained output trust, never trust from a rewritten file."""
+    room, shared, original, path = await _loaded_notebook(mock_server_docs_app.serverapp)
+    _, cell = shared.find_cell("stable-cell")
+    if live_trust is None:
+        if "trusted" in cell["metadata"]:
+            del cell["metadata"]["trusted"]
+    else:
+        cell["metadata"]["trusted"] = live_trust
+    original["cells"][0]["source"] = "edited source"
+    original["cells"][0]["metadata"]["trusted"] = True
+    original["cells"].append(nbformat.v4.new_code_cell(
+        "new external cell", id="external-rich-cell", metadata={"trusted": True},
+        outputs=[nbformat.v4.new_output("display_data", data={"text/html": "<b>external</b>"})],
+    ))
+    _external_write(path, original)
+    await room.file_api._check_file(shared)
+    _, retained = shared.find_cell("stable-cell")
+    _, added = shared.find_cell("external-rich-cell")
+    assert retained["metadata"].get("trusted") is (live_trust is True)
+    assert added["metadata"].get("trusted") is False

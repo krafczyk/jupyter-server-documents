@@ -351,9 +351,11 @@ class OutputsManager(LoggingConfigurable):
         This method processes a notebook that has been loaded from disk.
         Initial loads import outputs from the file. When ``live_notebook`` is
         supplied for an external edit, existing code-cell IDs retain their live
-        output references, execution count, and execution timing; the file owns
-        source, cell ordering, and other metadata. New code cells import their
-        outputs normally. Existing output files are not cleared in this mode.
+        output references, execution count, timing, and output trust. The file
+        owns source, cell ordering, and other metadata. Trust is copied from the
+        live state whose output payload is retained, never from the external
+        metadata for that cell. New code cells import their outputs normally.
+        Existing output files are not cleared in this mode.
 
         Args:
             file_id (str): The file identifier
@@ -396,6 +398,7 @@ class OutputsManager(LoggingConfigurable):
                 cell["outputs"] = deepcopy(live.get("outputs", []))
                 cell["execution_count"] = live.get("execution_count")
                 metadata = cell.setdefault("metadata", {})
+                metadata["trusted"] = live.get("metadata", {}).get("trusted") is True
                 execution = live.get("metadata", {}).get("execution")
                 if execution is None:
                     metadata.pop("execution", None)

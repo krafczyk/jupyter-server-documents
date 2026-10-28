@@ -47,6 +47,27 @@ def test_instantiation():
     op = OutputsManager()
     assert isinstance(op, OutputsManager)
 
+
+@pytest.mark.parametrize("live_trust", [True, False])
+def test_reconciled_output_trust_comes_from_live_payload(tmp_path, live_trust):
+    """Source-file metadata must neither revoke retained trust nor grant it."""
+    manager = OutputsManager()
+    manager.outputs_path = tmp_path / "outputs"
+    live_output = {"output_type": "display_data", "data": {"text/html": "<b>retained</b>"}, "metadata": {}}
+    reference = manager.write("file", "cell", live_output, asdict=True)
+    live = {"cells": [{
+        "id": "cell", "cell_type": "code", "source": "before", "outputs": [reference],
+        "execution_count": 1, "metadata": {"trusted": live_trust},
+    }]}
+    incoming = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(
+        "after", id="cell", metadata={"trusted": not live_trust},
+        outputs=[nbformat.v4.new_output("display_data", data={"text/html": "<b>not retained</b>"})],
+    )])
+    result = manager.process_loaded_notebook("file", {"content": incoming}, live_notebook=live)
+    assert result["content"]["cells"][0]["metadata"]["trusted"] is live_trust
+    assert manager.get_output("file", "cell", 0) == live_output
+
+
 def test_paths():
     """Verify that the paths are working properly."""
     op = OutputsManager()

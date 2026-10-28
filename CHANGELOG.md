@@ -2,6 +2,17 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## 0.2.5+mkchad.2
+
+### Bugs fixed
+
+- Preserve the live output's trusted status during external source reconciliation.
+  Version `0.2.5+mkchad.1` retained the output payload but accepted the reloaded
+  file's trust metadata, so a fresh browser could show blank hvPlot/HTML output
+  while an existing browser continued displaying it.
+- Keep untrusted retained outputs untrusted, and leave newly added external
+  outputs subject to normal notebook trust checks.
+
 ## 0.2.5+mkchad.1
 
 ### Bugs fixed
