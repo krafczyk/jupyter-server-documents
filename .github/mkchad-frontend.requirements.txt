@@ -1,0 +1,3 @@
+# Published upstream frontend reused by backend-only maintenance wheels.
+jupyter_server_documents==0.2.5 \
+    --hash=sha256:118addf3b559bb44ba4bed48d392db596f03df18ee5e116627f7ac1994cf9df0

@@ -126,6 +126,9 @@ verify that untrusted retained and newly imported outputs do not gain trust.
 
 ## Recovery limits and deployment
 
+For explicit MkChad-tag wheel publication and protected release tags, see
+[GitHub wheel releases](github-wheel-releases.md).
+
 Successful saving is required to reconstruct a collected room. Output or timing
 never captured/persisted cannot be reconstructed retrospectively. The notebook
 stores current cell results, not a permanent history of all executions.
