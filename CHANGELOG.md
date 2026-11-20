@@ -2,6 +2,18 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## 0.2.5+mkchad.3
+
+### Bugs fixed
+
+- Repair stale cached cell positions after shared notebook deletions and reloads,
+  preventing `IndexError: Array index out of range` during output clearing and
+  attachment. Resolve the destination by its stable cell ID instead.
+- Remove stale lookup entries for deleted cells without changing shared notebook
+  content or restarting the kernel.
+- Add regressions for cell edits, reloads, and output routing with output-service
+  storage enabled and disabled.
+
 ## 0.2.5+mkchad.2
 
 ### Bugs fixed

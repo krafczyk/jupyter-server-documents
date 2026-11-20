@@ -1,0 +1,11 @@
+{
+  "repository": "krafczyk/jupyter-server-documents",
+  "distribution": "jupyter_server_documents",
+  "maintenance_branch": "mkchad-v1",
+  "version_file": "package.json",
+  "frontend": {
+    "version": "0.2.5",
+    "source_commit": "d226408dcfb41aa80b7a78801e291d93656dd43a",
+    "wheel_sha256": "118addf3b559bb44ba4bed48d392db596f03df18ee5e116627f7ac1994cf9df0"
+  }
+}

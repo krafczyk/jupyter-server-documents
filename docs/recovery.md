@@ -1,9 +1,10 @@
 # Notebook recovery and external edits
 
-The MkChad maintenance build `0.2.5+mkchad.2` restores execution routing after
-notebook room cleanup, records timing on the server, and reconciles external
-notebook source edits. It targets ordinary JupyterLab use and OpenCode file-tool
-edits; Jupyter AI-specific behavior is not required.
+The MkChad maintenance build `0.2.5+mkchad.3` restores execution routing after
+notebook room cleanup, records timing on the server, reconciles external notebook
+source edits, and repairs stale cell positions after shared edits. It targets
+ordinary JupyterLab use and OpenCode file-tool edits; Jupyter AI-specific behavior
+is not required.
 
 ## Disconnect, finish offline, and reconnect
 
@@ -126,8 +127,8 @@ verify that untrusted retained and newly imported outputs do not gain trust.
 
 ## Cell lookup after deletion or document reload
 
-The unreleased backend correction on this branch repairs stale cached cell
-positions. After a preceding cell is deleted, a retained cell's old index can
+Version `0.2.5+mkchad.3` repairs stale cached cell positions. After a preceding
+cell is deleted, a retained cell's old index can
 fall outside the shortened CRDT array. Earlier builds, including
 `0.2.5+mkchad.2`, raise `IndexError: Array index out of range` in
 `YNotebook.find_cell`. This can break both clearing old outputs and attaching
@@ -153,6 +154,9 @@ in-memory cache or restore output references from failed callbacks. Deployment
 still requires the server-process transition described below.
 
 ## Recovery limits and deployment
+
+For explicit MkChad-tag wheel publication and protected release tags, see
+[GitHub wheel releases](github-wheel-releases.md).
 
 Successful saving is required to reconstruct a collected room. Output or timing
 never captured/persisted cannot be reconstructed retrospectively. The notebook
