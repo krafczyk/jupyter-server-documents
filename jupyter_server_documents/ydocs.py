@@ -1,5 +1,7 @@
-"""
-Extend the YNotebook class with some useful utilities for searching Notebooks.
+"""Extend shared notebooks with stable-ID cell lookup and metadata utilities.
+
+Cell positions are cached locally and revalidated against the current CRDT
+array, so edits and reloads can move or remove cells without breaking lookup.
 """
 import sys
 # See compatibility note on `group` keyword in
@@ -14,7 +16,8 @@ from jupyter_ydoc.ynotebook import YNotebook as UpstreamYNotebook
 
 class YNotebook(UpstreamYNotebook):
     __doc__ = """
-    Extends upstream YNotebook to include extra methods.
+    Extends upstream YNotebook with stable-ID lookup and metadata utilities.
+    Cached cell positions are repaired after shared-document edits and reloads.
     
     Upstream docstring:
     """ + UpstreamYNotebook.__doc__
@@ -36,9 +39,18 @@ class YNotebook(UpstreamYNotebook):
         return self._ymeta
 
     def find_cell(self, cell_id):
-        """Find a cell with a given cell_id in the list of cells.
-        
-        This uses caching if we have seen the cell previously.
+        """Find a cell by stable ID, repairing stale cached positions as needed.
+
+        Args:
+            cell_id (str): ID of the cell to locate in the current document.
+
+        Returns:
+            tuple: The current integer index and ``pycrdt.Map`` cell, or
+            ``(None, None)`` if the cell was removed or does not exist.
+
+        Updates the local index cache without changing the shared document.
+        An out-of-range or mismatched cached index triggers a fresh scan rather
+        than raising an indexing error or returning another cell.
         """
         # Find the target_cell and its cell_index and cache
         target_cell = None
@@ -47,7 +59,7 @@ class YNotebook(UpstreamYNotebook):
             # See if we have a cached value for the cell_index
             cell_index = self._cell_indices[cell_id]
             target_cell = self.ycells[cell_index]
-        except KeyError:
+        except (KeyError, IndexError):
             # Do a linear scan to find the cell
             cell_index, target_cell = self.scan_cells(cell_id)
         else:
@@ -57,12 +69,19 @@ class YNotebook(UpstreamYNotebook):
         return cell_index, target_cell
 
     def scan_cells(self, cell_id):
-        """Find the cell with a given cell_id in the list of cells.
-        
-        This does a simple linear scan of the cells, but in reverse order because
-        we believe that users are more often running cells towards the end of the
-        notebook.
+        """Scan the current cells in reverse order and refresh a cached index.
+
+        Args:
+            cell_id (str): ID of the cell to locate in the current document.
+
+        Returns:
+            tuple: The current integer index and ``pycrdt.Map`` cell, or
+            ``(None, None)`` if the cell does not exist. A missing cell's stale
+            cache entry is removed; the shared document is not modified.
+
+        Reverse order favors the cells near the end that users often execute.
         """
+        self._cell_indices.pop(cell_id, None)
         target_cell = None
         cell_index = None
         for i in reversed(range(0, len(self.ycells))):

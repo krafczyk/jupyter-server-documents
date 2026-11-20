@@ -124,6 +124,34 @@ build reproducibly showed `model.trusted = false` and no canvases on that second
 client; the follow-up retains trust and renders them. Negative backend tests
 verify that untrusted retained and newly imported outputs do not gain trust.
 
+## Cell lookup after deletion or document reload
+
+The unreleased backend correction on this branch repairs stale cached cell
+positions. After a preceding cell is deleted, a retained cell's old index can
+fall outside the shortened CRDT array. Earlier builds, including
+`0.2.5+mkchad.2`, raise `IndexError: Array index out of range` in
+`YNotebook.find_cell`. This can break both clearing old outputs and attaching
+new outputs, even when the kernel computation and plot rendering succeed.
+
+Lookup now rescans by stable cell ID when a cached index is out of range, as it
+already does when that position contains a different cell. Missing cells return
+`(None, None)` and their stale cache entries are removed. Lookup does not change
+cell IDs, source, output, execution metadata, or the running kernel.
+
+The regression tests cover deletion, insertion, full-document reloads, missing
+and reinserted IDs, and actual output-clear/write coroutines with output-service
+storage enabled and disabled. They use synthetic notebooks and isolated output
+files; session and room lookups are mocked. Run the focused checks from the
+checkout with an environment containing the runtime dependencies:
+
+```bash
+python -B -m unittest -v jupyter_server_documents.tests.test_ydocs
+```
+
+Installing a corrected package does not patch the already-running server's
+in-memory cache or restore output references from failed callbacks. Deployment
+still requires the server-process transition described below.
+
 ## Recovery limits and deployment
 
 Successful saving is required to reconstruct a collected room. Output or timing
