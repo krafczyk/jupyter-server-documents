@@ -2,6 +2,8 @@
 
 Existing cell IDs retain live output, count, and timing during external reloads;
 new cells and source changes are synchronized through the normal Y-document.
+Saves require loaded content and a currently resolved destination. Failed writes
+remain pending and propagate to the room's shutdown or autosave supervisor.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ class YRoomFileAPI(LoggingConfigurable):
     - Detecting and responding to in-band and out-of-band file changes
     - Managing notebook outputs through the OutputsManager
     - Applying external source edits without replacing live execution fields
+    - Rejecting unresolved save paths and reporting unacknowledged writes
 
     Usage:
         1. Create instance with parent YRoom: `file_api = YRoomFileAPI(parent=yroom)`
@@ -171,6 +174,7 @@ class YRoomFileAPI(LoggingConfigurable):
         self._external_change_pending = False
         self._stopped = False
         self._is_writable = True
+        self._watch_file_task = None
 
         # Initialize content-related primitives
         self._content_loading = False
@@ -703,57 +707,72 @@ class YRoomFileAPI(LoggingConfigurable):
     async def save(self, jupyter_ydoc: YBaseDoc):
         """Save the JupyterYDoc to disk immediately.
 
-        This method performs a synchronous save operation, writing the YDoc
-        content to the filesystem via ContentsManager. It also:
+        This coroutine awaits a ContentsManager write of loaded, writable YDoc
+        content. It also:
         - Processes notebook outputs through OutputsManager if applicable
         - Updates the last_modified timestamp
-        - Clears the dirty flag on the YDoc
+        - Clears the dirty flag only after a write with no newer pending update
         - Calculates and updates the adaptive poll interval
 
         The method works even when the FileAPI is stopped, making it useful
-        for final saves during shutdown.
+        for final saves during shutdown. Unloaded or known read-only documents
+        are skipped without clearing dirty or pending-save state. A document
+        that has not finished loading must not overwrite the existing file.
 
         Args:
             jupyter_ydoc: The YBaseDoc instance to save.
 
         Returns:
-            None after the save attempt. Write failures are logged and scheduled
-            for retry by the existing watcher.
+            None after an acknowledged write or a skipped unloaded/read-only
+            document. Successful writes update modification and timing state.
 
         Raises:
-            External source conflicts and preflight read errors propagate before
-            writing, including during final cleanup. Resolve external changes
-            before discarding the live document or stopping the server.
+            RuntimeError: The file ID has no path, or a notebook's destination
+                changed after its external-edit preflight. No stale-path
+                fallback or write is attempted in those cases.
+            Exception: ContentsManager read/write errors and external source
+                conflicts propagate, including during final cleanup. Failures
+                are logged and leave the document dirty and scheduled for retry;
+                a stopped FileAPI requires an explicit retry after correction.
 
         Note:
             In normal operation, consumers should use schedule_save() instead.
             Only call this directly when you need an immediate save while the
             FileAPI is stopped (e.g., during room shutdown).
         """
-        await self.reconcile_before_save(jupyter_ydoc)
-        # Record start time for adaptive timing
-        start_time = time.perf_counter()
+        if not self.content_loaded:
+            self.log.debug("Not saving unloaded document for room '%s'.", self.room_id)
+            return
+        if not self._is_writable:
+            return
 
         try:
-            # Return immediately if the content manager has marked this file as non-writable
-            if not self._is_writable:
-                return
-            # Build arguments to `CM.save()`
-            path = self.get_path()
-            content = jupyter_ydoc.source
-            file_format = self.file_format
-            file_type = self.file_type if self.file_type in SAVEABLE_FILE_TYPES else "file"
+            await self.reconcile_before_save(jupyter_ydoc)
+            start_time = time.perf_counter()
 
-            # Set `_save_scheduled=False` before the `await` to make sure we
-            # save on the next tick when a save is scheduled while `CM.get()` is
-            # being awaited.
-            self._save_scheduled = False
-
-            if self.file_type == "notebook":
-                content = self.outputs_manager.process_saving_notebook(content, self.file_id)
-
-            # Save the YDoc via the ContentsManager
             async with self._content_lock:
+                if not self._is_writable:
+                    return
+                # Resolve after waiting for the lock: the mapping can change
+                # while preflight reads or another ContentsManager call awaits.
+                path = self.get_path()
+                if not path:
+                    raise RuntimeError(
+                        f"Cannot save room '{self.room_id}': file ID has no path."
+                    )
+                if self.file_type == "notebook" and path != self._last_path:
+                    raise RuntimeError(
+                        f"Cannot save room '{self.room_id}': notebook path changed "
+                        "after preflight; retry against the current path."
+                    )
+                content = jupyter_ydoc.source
+                file_format = self.file_format
+                file_type = self.file_type if self.file_type in SAVEABLE_FILE_TYPES else "file"
+                if self.file_type == "notebook":
+                    content = self.outputs_manager.process_saving_notebook(content, self.file_id)
+
+                # A new update during the write must schedule another save.
+                self._save_scheduled = False
                 file_data = await ensure_async(self.contents_manager.save(
                     {
                         "format": file_format,
@@ -771,9 +790,8 @@ class YRoomFileAPI(LoggingConfigurable):
                 self.log.debug(f"Resetting last_modified to {file_data['last_modified']}")
                 self._last_modified = file_data['last_modified']
 
-            # Set `dirty` to `False` to hide the "unsaved changes" icon in the
-            # JupyterLab tab for this YDoc in the frontend.
-            jupyter_ydoc.dirty = False
+            # The write acknowledged its snapshot, not edits arriving during I/O.
+            jupyter_ydoc.dirty = self._save_scheduled
 
             # Calculate save duration
             save_duration = time.perf_counter() - start_time
@@ -794,8 +812,11 @@ class YRoomFileAPI(LoggingConfigurable):
             )
 
         except Exception as e:
-            self.log.error("An exception occurred when saving JupyterYDoc.")
+            self._save_scheduled = True
+            jupyter_ydoc.dirty = True
+            self.log.error("Could not save JupyterYDoc for room '%s'.", self.room_id)
             self.log.exception(e)
+            raise
     
 
     def stop(self) -> None:

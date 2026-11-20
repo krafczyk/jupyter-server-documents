@@ -1,8 +1,9 @@
 # Notebook recovery and external edits
 
-The MkChad maintenance build `0.2.5+mkchad.3` restores execution routing after
+The MkChad maintenance build `0.2.5+mkchad.4` restores execution routing after
 notebook room cleanup, records timing on the server, reconciles external notebook
-source edits, and repairs stale cell positions after shared edits. It targets
+source edits, repairs stale cell positions after shared edits, and validates
+shutdown saves before writing. It targets
 ordinary JupyterLab use and OpenCode file-tool edits; Jupyter AI-specific behavior
 is not required.
 
@@ -152,6 +153,41 @@ python -B -m unittest -v jupyter_server_documents.tests.test_ydocs
 Installing a corrected package does not patch the already-running server's
 in-memory cache or restore output references from failed callbacks. Deployment
 still requires the server-process transition described below.
+
+## Shutdown saves and disappearing paths
+
+Version `0.2.5+mkchad.4` includes the cell-index fix above and corrects a separate
+shutdown save failure. Earlier builds could pass a missing file-ID mapping as
+`path=None` to ContentsManager, producing `'NoneType' object has no attribute
+'strip'` with both Jupytext and the standard Jupyter file manager.
+
+- A document that has not finished initial loading is not saved. Its placeholder
+  content must not overwrite the existing file. Stopping before the watcher has
+  started is also supported.
+- Loaded, writable content is reconciled before saving. The destination is then
+  resolved inside the write lock, after any wait for other I/O. A missing path
+  or a notebook path changed since preflight raises an actionable `RuntimeError`
+  without writing. The last known path is not used as a fallback: it could refer
+  to a deleted or replaced file.
+- Read/write failures propagate to the caller and leave the document dirty and
+  scheduled for retry. The room manager reports unsuccessful final saving and
+  retains its room reference instead of acknowledging successful deletion.
+- The watcher retries while running. A stopped FileAPI supports an explicit
+  `await file_api.save(shared_document)` after its mapping or storage failure is
+  corrected. A loaded, stopped FileAPI with a valid destination still saves
+  normally. Retained in-memory state is not a recovery journal across server exit.
+- Updates arriving during a successful write remain dirty and pending for the
+  next save rather than being marked saved by the older write's completion.
+
+The synthetic regressions exercise missing paths before and after preflight,
+path loss while waiting for the lock, rename/retry, unloaded/read-only content,
+write failure/retry, and updates during a write. A room-manager integration test
+checks that failed shutdown saving preserves live source, output, and the
+existing disk version, then verifies a successful explicit save after recovery.
+
+```bash
+python -B -m unittest -v jupyter_server_documents.tests.test_shutdown_saves
+```
 
 ## Recovery limits and deployment
 

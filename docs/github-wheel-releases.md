@@ -3,7 +3,7 @@
 `MkChad wheels` builds and tests pushes to `mkchad-v1` without publishing. Only
 an explicit `vMAJOR.MINOR.PATCH+mkchad.N` tag push publishes a GitHub release.
 `N` is a positive maintenance counter; keep the PEP 440 local modifier, such as
-`0.2.5+mkchad.3`, with matching tag `v0.2.5+mkchad.3`.
+`0.2.5+mkchad.4`, with matching tag `v0.2.5+mkchad.4`.
 
 ## Deliberate release
 
@@ -11,8 +11,8 @@ Commit the intended version in `package.json`, push `mkchad-v1`, and wait for it
 `MkChad wheels` build to pass. Then tag the reviewed commit explicitly:
 
 ```bash
-git tag -a 'v0.2.5+mkchad.3' <reviewed-commit> -m 'MkChad Server Documents 0.2.5+mkchad.3'
-git push origin 'refs/tags/v0.2.5+mkchad.3'
+git tag -a 'v0.2.5+mkchad.4' <reviewed-commit> -m 'MkChad Server Documents 0.2.5+mkchad.4'
+git push origin 'refs/tags/v0.2.5+mkchad.4'
 ```
 
 Tag format, exact package-version agreement, maintenance-branch ancestry, backend

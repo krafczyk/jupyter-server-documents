@@ -5,6 +5,7 @@ from copy import deepcopy
 from contextlib import suppress
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import nbformat
 import pycrdt
@@ -192,3 +193,34 @@ async def test_external_source_edit_preserves_only_existing_output_trust(mock_se
     _, added = shared.find_cell("external-rich-cell")
     assert retained["metadata"].get("trusted") is (live_trust is True)
     assert added["metadata"].get("trusted") is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_save_with_lost_path_retains_live_document(mock_server_docs_app):
+    """A failed final write must not be acknowledged as successful room deletion."""
+    app = mock_server_docs_app.serverapp
+    room, shared, original, path = await _loaded_notebook(app)
+    manager = app.web_app.settings["yroom_manager"]
+    _, cell = shared.find_cell("stable-cell")
+    cell["source"] = pycrdt.Text("unsaved live source")
+    shared.dirty = True
+    room.file_api.schedule_save()
+    before = shared.source
+    outputs = room.outputs_manager.get_outputs(room.file_api.file_id, "stable-cell")
+
+    with patch.object(room.file_api, "get_path", side_effect=[path.name, None]):
+        assert not await manager.delete_room(room.room_id)
+    assert manager.has_room(room.room_id)
+    assert shared.source == before
+    assert shared.dirty
+    assert room.file_api._save_scheduled
+    assert nbformat.read(path, as_version=4)["cells"][0]["source"] == original["cells"][0]["source"]
+    assert room.outputs_manager.get_outputs(room.file_api.file_id, "stable-cell") == outputs
+
+    # A stopped FileAPI supports an explicit retry once its mapping is restored.
+    # Persist this synthetic room before removing the retained test registration.
+    await room.file_api.save(shared)
+    assert nbformat.read(path, as_version=4)["cells"][0]["source"] == "unsaved live source"
+    assert not shared.dirty
+    assert not room.file_api._save_scheduled
+    manager._rooms_by_id.pop(room.room_id)

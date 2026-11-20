@@ -2,6 +2,20 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## 0.2.5+mkchad.4
+
+### Bugs fixed
+
+- Validate the current save destination after acquiring the write lock. Missing
+  file-ID mappings and notebook paths changed since preflight fail before any
+  write instead of passing `None` to Jupytext or another ContentsManager.
+- Skip final saves of unloaded documents so placeholders cannot overwrite an
+  existing file, and allow stopping a FileAPI before its watcher has started.
+- Propagate save failures to the room manager and retain dirty/pending state
+  rather than acknowledging an unsuccessful final save. Updates arriving during
+  an otherwise successful write also remain dirty and pending.
+- Retain the stale cell-index/output-routing correction from `0.2.5+mkchad.3`.
+
 ## 0.2.5+mkchad.3
 
 ### Bugs fixed
